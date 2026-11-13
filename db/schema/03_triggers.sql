@@ -78,6 +78,7 @@ set search_path = kalugin_food, exts
 as $$
 declare
     v_order_id uuid;
+    v_status   order_pay_status;
 begin
     foreach v_order_id in array
         case tg_op
@@ -86,16 +87,20 @@ begin
             else array[old.order_id, new.order_id]
         end
     loop
+        select case
+                   when bool_or(p.status = 'успех') then 'оплачен'
+                   when count(*) > 0 and bool_and(p.status = 'ошибка') then 'ошибка'
+                   else 'ожидает'
+               end::order_pay_status
+          into v_status
+          from payment p
+         where p.order_id = v_order_id;
+
+        -- строка заказа переписывается, только если статус действительно изменился
         update "order" o
-           set pay_status = (
-                   select case
-                              when bool_or(p.status = 'успех') then 'оплачен'
-                              when count(*) > 0 and bool_and(p.status = 'ошибка') then 'ошибка'
-                              else 'ожидает'
-                          end::order_pay_status
-                     from payment p
-                    where p.order_id = v_order_id)
-         where o.order_id = v_order_id;
+           set pay_status = v_status
+         where o.order_id = v_order_id
+           and o.pay_status is distinct from v_status;
     end loop;
 
     return null;

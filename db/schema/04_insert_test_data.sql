@@ -1,5 +1,8 @@
 -- FOOD-102. Генератор тестовых данных.
 --
+-- value — число записей в справочниках, в крупных таблицах value × 5;
+-- 1 млн строк = value 200000.
+--
 -- Распределение (BR-11.7) на один вызов insert_test_data(value):
 --   value     : client, courier, product_category, restaurant;
 --   value * 5 : address (value — под рестораны, value * 4 — под клиентов),
@@ -7,9 +10,35 @@
 --   client_address, order_structure — сколько нужно для связности;
 --   courier_pay — по каждому курьеру за последние 6 месяцев (BR-10.2, BR-10.7).
 --
+-- Верхняя граница value — 200 000 (1 млн строк в каждой крупной таблице,
+-- около 6 млн строк за вызов). Весь вызов — одна транзакция: массивы
+-- идентификаторов порции держатся в памяти процедуры, а каждый идентификатор
+-- — отдельный вызов exts.uuid_generate_v4() (около 29 × value вызовов).
+-- Для большего объёма процедуру нужно вызвать несколько раз: данные
+-- добавляются, а не заменяются.
+--
 -- Процедуру можно вызывать многократно без очистки: каждый вызов добавляет
 -- новую порцию данных и связывает между собой только строки этой порции,
 -- поэтому выплаты курьеров прошлых вызовов не теряют согласованность.
+-- Уникальные поля (название категории, логин и телефон клиента,
+-- идентификатор транзакции) вставляются с on conflict do nothing, недостающие
+-- строки довставляются, пока их не станет ровно столько, сколько нужно.
+--
+-- Все вставки пакетные (insert ... select ... from generate_series), без
+-- построчных циклов. Строки порции связываются по номеру: идентификаторы
+-- курьеров, клиентов, адресов, ресторанов и блюд собираются в массивы,
+-- элемент берётся по случайному индексу — без запросов вида
+-- «случайная строка таблицы». exts.uuid_generate_v4() вызывается только для
+-- идентификаторов (BR-11.1). Заказы с составом, оплатами и отзывами
+-- генерируются пакетами по c_chunk заказов, чтобы объём одного оператора
+-- (и очередь проверок FK в памяти) не рос вместе с value.
+--
+-- Случайная строка — буквы а..я без префиксов и словарей:
+--   (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+--      from generate_series(1, <длина>))
+-- Длина — столбец внешнего запроса, поэтому подзапрос коррелированный и
+-- выполняется для каждой строки заново. Для varchar(N) длина случайная
+-- от 1 до N, для text — от 1 до 200.
 --
 -- Процедура не вызывает другие функции и процедуры схемы: courier_pay,
 -- блюда и рейтинги заполняются прямыми INSERT/UPDATE. При этом на вставляемых
@@ -26,90 +55,54 @@ language plpgsql
 set search_path = kalugin_food, exts
 as $$
 declare
-    -- справочники для правдоподобных строк
-    c_streets    text[] := array['ул. Ленина', 'ул. Мира', 'ул. Гагарина', 'ул. Пушкина',
-                                 'ул. Советская', 'ул. Садовая', 'ул. Лесная', 'ул. Школьная',
-                                 'наб. Речная', 'ул. Молодёжная', 'пр. Победы', 'ул. Центральная'];
-    c_surnames   text[] := array['Иванов', 'Петров', 'Сидоров', 'Смирнов', 'Кузнецов',
-                                 'Попов', 'Соколов', 'Лебедев', 'Козлов', 'Новиков'];
-    c_names      text[] := array['Иван', 'Пётр', 'Алексей', 'Дмитрий', 'Сергей',
-                                 'Андрей', 'Михаил', 'Николай'];
-    c_patronyms  text[] := array['Иванович', 'Петрович', 'Сергеевич', 'Алексеевич',
-                                 'Дмитриевич', 'Андреевич'];
-    c_categories text[] := array['Супы', 'Салаты', 'Пицца', 'Роллы', 'Бургеры', 'Десерты',
-                                 'Напитки', 'Горячее', 'Закуски', 'Завтраки', 'Паста', 'Гриль'];
-    c_rest_names text[] := array['Пельменная', 'Траттория', 'Суши-бар', 'Бургерная', 'Кофейня',
-                                 'Чайхана', 'Блинная', 'Гриль-хаус', 'Пиццерия', 'Столовая'];
-    c_dishes     text[] := array['Борщ', 'Солянка', 'Цезарь', 'Оливье', 'Маргарита', 'Пепперони',
-                                 'Филадельфия', 'Калифорния', 'Чизбургер', 'Тирамису', 'Морс',
-                                 'Плов', 'Шашлык', 'Карбонара', 'Сырники', 'Блины с мясом'];
-    c_order_notes text[] := array['Позвонить за 10 минут', 'Без лука', 'Оставить у двери',
-                                  'Домофон не работает', 'Нужны приборы', 'Без комментариев'];
-    c_review_txt text[] := array['Очень вкусно', 'Привезли быстро', 'Всё остыло',
-                                 'Порция маленькая', 'Отличный сервис', 'Буду заказывать ещё',
-                                 'Курьер вежливый', 'Средне'];
+    c_max_value   constant integer := 200000;
+    -- заказов в одном пакете; кратно 5, см. раздел 8
+    c_chunk       constant integer := 50000;
 
     v_cat         uuid[] := '{}';
-    v_cour        uuid[] := '{}';
-    v_cour_start  timestamp[] := '{}';
-    v_cour_end    timestamp[] := '{}';
-    v_cour_fired  boolean[] := '{}';
-    v_addr        uuid[] := '{}';
-    v_rest        uuid[] := '{}';
     v_client      uuid[] := '{}';
-    v_prod        uuid[] := '{}';
-    v_prod_price  numeric[] := '{}';
-    v_extra_addr  uuid[];          -- дополнительный (соседский) адрес клиента или NULL
+    v_cour        uuid[];
+    v_cour_start  timestamp[];
+    v_cour_end    timestamp[];
+    v_cour_fired  boolean[];
+    v_addr        uuid[];
+    v_extra       boolean[];       -- у клиента i есть ещё и адрес соседа
+    v_rest        uuid[];
+    v_rest_status restaurant_status[];
+    v_rest_act    integer[];       -- номера активных ресторанов
+    v_prod        uuid[];
+    v_price       integer[];
+    v_prod_status product_status[];
+    v_ord         uuid[];          -- заказы текущего пакета
 
-    v_id          uuid;
-    v_price       numeric;
-    v_text        text;
-    v_hire        date;
-    v_dismiss     date;
-    v_status_c    courier_status;
     v_active_st   courier_status[] := array_remove(enum_range(null::courier_status), 'уволен');
     v_rest_st     restaurant_status[] := enum_range(null::restaurant_status);
+    v_prod_st     product_status[] := enum_range(null::product_status);
     v_order_all   order_status[] := enum_range(null::order_status);
-    -- незавершённые: создан .. в_доставке; завершённые: доставлен .. отменён (порядок enum)
-    v_order_open  order_status[] := enum_range(null::order_status, 'в_доставке'::order_status);
+    -- завершённые: доставлен .. отменён (порядок enum)
     v_order_done  order_status[] := enum_range('доставлен'::order_status, null::order_status);
-    v_start_time  time;
-    v_base        bigint;
+    v_pay_types   payment_type[] := enum_range(null::payment_type);
+    v_rev_types   review_entity_type[] := enum_range(null::review_entity_type);
+
     -- месяцы выплат: текущий и пять предыдущих (BR-10.7)
     v_pay_start   date := (date_trunc('month', current_date) - interval '5 months')::date;
     -- даты данных: последние 180 дней, но не раньше первого месяца выплат,
     -- чтобы у каждого доставленного заказа был месяц в courier_pay
     v_window_start date := greatest(v_pay_start, current_date - 180);
 
-    -- заказ
-    v_ci          integer;
-    v_ri          integer;
-    v_ki          integer;
-    v_ai          integer;
-    v_order_id    uuid;
-    v_order_addr  uuid;
-    v_order_ts    timestamp;
-    v_deliv_ts    timestamp;
-    v_order_st    order_status;
-    v_items       integer[];
-    v_swap        integer;
-    v_qty         numeric[];
-    v_amount      numeric;
-    v_n_items     integer;
-    v_pi          integer;
-    v_entity_type review_entity_type;
-    v_entity_id   uuid;
-
-    -- выплаты
-    v_coef        numeric;
-    v_last_coef   numeric;
-    v_rec         record;
-
-    i             integer;
-    j             integer;
+    v_from        integer;
+    v_cnt         integer;
+    v_added       integer;
+    v_try         integer;
 begin
     if value is null or value < 1 then
         raise exception 'insert_test_data: value должно быть положительным, передано %', value;
+    end if;
+
+    if value > c_max_value then
+        raise exception 'insert_test_data: value не больше % (это % строк в крупных таблицах), передано %. '
+                        'Для большего объёма вызовите процедуру несколько раз',
+                        c_max_value, c_max_value * 5, value;
     end if;
 
     -- rating_change не пересчитывает рейтинг на каждый отзыв генератора:
@@ -118,379 +111,559 @@ begin
     perform set_config('kalugin_food.skip_rating', 'on', true);
 
     -- -----------------------------------------------------------------------
-    -- 1. Категории блюд (value). Название уникально (BR-5.7).
+    -- 1. Категории блюд (value). Название уникально (BR-5.7): совпавшие
+    --    с уже существующими пропускаются и довставляются новыми.
     -- -----------------------------------------------------------------------
-    select count(*) into v_base from product_category;
-    for i in 1..value loop
-        loop
-            v_text := c_categories[1 + floor(random() * cardinality(c_categories))::int]
-                      || ' №' || (v_base + i)::text;
-            exit when not exists (select 1 from product_category
-                                   where product_category_name = v_text);
-            v_base := v_base + value;
-        end loop;
-        insert into product_category (product_category_id, product_category_name)
-        values (exts.uuid_generate_v4(), v_text)
-        returning product_category_id into v_id;
-        v_cat := v_cat || v_id;
+    v_try := 0;
+    while cardinality(v_cat) < value loop
+        v_try := v_try + 1;
+        if v_try > 1000 then
+            raise exception 'insert_test_data: не удалось подобрать % уникальных названий категорий',
+                value - cardinality(v_cat);
+        end if;
+
+        with ins as (
+            insert into product_category (product_category_id, product_category_name)
+            select exts.uuid_generate_v4(),
+                   (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                      from generate_series(1, g.len))
+              from (select 1 + floor(random() * 100)::int as len
+                      from generate_series(1, value - cardinality(v_cat))) as g
+            on conflict (product_category_name) do nothing
+            returning product_category_id
+        )
+        select v_cat || coalesce(array_agg(product_category_id), '{}')
+          into v_cat
+          from ins;
     end loop;
 
     -- -----------------------------------------------------------------------
-    -- 2. Курьеры (value). Все даты — внутри окна v_window_start .. сегодня:
+    -- 2. Курьеры (value). ФИО — три случайных слова по 1..49 букв с заглавной
+    --    (итог не длиннее 150). Все даты — внутри окна v_window_start .. сегодня:
     --    не старше 180 дней и не раньше 1-го числа месяца пять месяцев назад.
     --    Выплаты генерируются за все месяцы этого окна, поэтому каждый
     --    доставленный заказ попадает в месяц, по которому есть запись courier_pay.
     --    Первый курьер всегда работает и нанят в начале окна (BR-6.6).
     --    Около 20% остальных — уволены, с датой увольнения не раньше даты
-    --    найма (BR-6.3).
+    --    найма (BR-6.3). Период работы курьера (найм .. увольнение или
+    --    сейчас) запоминается в массивах — в нём лежат его заказы.
     -- -----------------------------------------------------------------------
-    for i in 1..value loop
-        if i = 1 then
-            v_hire := v_window_start;
-        else
-            v_hire := v_window_start + floor(random() * (current_date - v_window_start + 1))::int;
-        end if;
-
-        if i > 1 and random() < 0.2 then
-            v_status_c := 'уволен';
-            v_dismiss := v_hire + floor(random() * (current_date - v_hire + 1))::int;
-        else
-            v_status_c := v_active_st[1 + floor(random() * cardinality(v_active_st))::int];
-            v_dismiss := null;
-        end if;
-
+    with ins as (
         insert into courier (courier_id, fio, phone_number, status,
                              hire_date, dismissal_date, coefficient)
-        values (exts.uuid_generate_v4(),
-                c_surnames[1 + floor(random() * cardinality(c_surnames))::int] || ' '
-                    || c_names[1 + floor(random() * cardinality(c_names))::int] || ' '
-                    || c_patronyms[1 + floor(random() * cardinality(c_patronyms))::int],
-                '+79' || lpad(floor(random() * 1000000000)::bigint::text, 9, '0'),
-                v_status_c, v_hire, v_dismiss, 0.1)
-        returning courier_id into v_id;
-
-        v_cour       := v_cour || v_id;
-        v_cour_start := v_cour_start || v_hire::timestamp;
-        v_cour_end   := v_cour_end || case
-                            when v_dismiss is null then localtimestamp
-                            else least(v_dismiss + interval '23 hours 59 minutes', localtimestamp)
-                        end;
-        v_cour_fired := v_cour_fired || (v_dismiss is not null);
-    end loop;
+        select exts.uuid_generate_v4(),
+               -- заглавная А..Я и строчные буквы; initcap не годится: при
+               -- локали C он не меняет регистр кириллицы
+               chr(1040 + floor(random() * 32)::int)
+                   || coalesce((select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                                  from generate_series(2, c.len1)), '')
+                   || ' ' || chr(1040 + floor(random() * 32)::int)
+                   || coalesce((select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                                  from generate_series(2, c.len2)), '')
+                   || ' ' || chr(1040 + floor(random() * 32)::int)
+                   || coalesce((select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                                  from generate_series(2, c.len3)), ''),
+               '+79' || lpad(floor(random() * 1000000000)::bigint::text, 9, '0'),
+               case when c.fired then 'уволен'::courier_status
+                    else v_active_st[1 + floor(random() * cardinality(v_active_st))::int]
+               end,
+               c.hire,
+               case when c.fired
+                    then c.hire + floor(random() * (current_date - c.hire + 1))::int
+               end,
+               0.1
+          from (select case when g.i = 1 then v_window_start
+                            else v_window_start
+                                 + floor(random() * (current_date - v_window_start + 1))::int
+                       end                               as hire,
+                       g.i > 1 and random() < 0.2        as fired,
+                       1 + floor(random() * 49)::int     as len1,
+                       1 + floor(random() * 49)::int     as len2,
+                       1 + floor(random() * 49)::int     as len3
+                  from generate_series(1, value) as g(i)) as c
+        returning courier_id, hire_date, dismissal_date
+    )
+    select array_agg(courier_id),
+           array_agg(hire_date::timestamp),
+           array_agg(case
+                         when dismissal_date is null then localtimestamp
+                         else least(dismissal_date + interval '23 hours 59 minutes', localtimestamp)
+                     end),
+           array_agg(dismissal_date is not null)
+      into v_cour, v_cour_start, v_cour_end, v_cour_fired
+      from ins;
 
     -- -----------------------------------------------------------------------
     -- 3. Адреса (value * 5): первые value — под рестораны, остальные — клиентам.
-    --    Квартира/офис необязательна (BR-3.2).
+    --    Улица — 1..150 букв; дом — 1..10 символов: номер и буквы (обрезаются
+    --    по длине, поэтому дом всегда начинается с цифры); квартира/офис
+    --    необязательна (BR-3.2), иначе 1..10 символов так же, как дом.
     -- -----------------------------------------------------------------------
-    for i in 1..value * 5 loop
+    with ins as (
         insert into address (address_id, street, house_number, apartment_office)
-        values (exts.uuid_generate_v4(),
-                c_streets[1 + floor(random() * cardinality(c_streets))::int],
-                (1 + floor(random() * 150))::int::text
-                    || case when random() < 0.15 then 'А' else '' end,
-                case
-                    when random() < 0.3 then null
-                    when i <= value then 'оф. ' || (1 + floor(random() * 50))::int
-                    else (1 + floor(random() * 300))::int::text
-                end)
-        returning address_id into v_id;
-        v_addr := v_addr || v_id;
+        select exts.uuid_generate_v4(),
+               (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                  from generate_series(1, a.len_street)),
+               left((1 + floor(random() * 300))::int::text
+                    || (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                          from generate_series(1, a.len_house)),
+                    a.len_house),
+               case when not a.no_apartment then
+                   left((1 + floor(random() * 500))::int::text
+                        || (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                              from generate_series(1, a.len_apartment)),
+                        a.len_apartment)
+               end
+          from (select 1 + floor(random() * 150)::int as len_street,
+                       1 + floor(random() * 10)::int  as len_house,
+                       random() < 0.3                 as no_apartment,
+                       1 + floor(random() * 10)::int  as len_apartment
+                  from generate_series(1, value * 5)) as a
+        returning address_id
+    )
+    select array_agg(address_id) into v_addr from ins;
+
+    -- -----------------------------------------------------------------------
+    -- 4. Рестораны (value): у ресторана i адрес v_addr[i] (BR-3.3).
+    --    Первый ресторан всегда активен — на активные рестораны оформляются
+    --    незавершённые заказы. Время закрытия позже открытия (BR-4.4):
+    --    открытие 06:00..11:59, работа 8..12 часов, закрытие не позже 23:59.
+    --    Название — 1..100 букв, описание и реквизиты — 1..200: BR-4.5
+    --    описывает содержание реквизитов, но не формат, поэтому шаблона
+    --    «ИНН …» нет.
+    -- -----------------------------------------------------------------------
+    select array_agg(r.id order by r.i),
+           array_agg(r.status order by r.i),
+           array_agg(r.i order by r.i) filter (where r.status = 'активен')
+      into v_rest, v_rest_status, v_rest_act
+      from (select g.i,
+                   exts.uuid_generate_v4() as id,
+                   case when g.i = 1 or random() < 0.8 then 'активен'::restaurant_status
+                        else v_rest_st[1 + floor(random() * cardinality(v_rest_st))::int]
+                   end as status
+              from generate_series(1, value) as g(i)) as r;
+
+    insert into restaurant (restaurant_id, restaurant_name, address_id, description,
+                            work_start, work_end, company_details, rating, status)
+    select v_rest[r.i],
+           (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+              from generate_series(1, r.len_name)),
+           v_addr[r.i],
+           (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+              from generate_series(1, r.len_description)),
+           r.work_start,
+           r.work_start + (8 + floor(random() * 5))::int * interval '1 hour',
+           (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+              from generate_series(1, r.len_details)),
+           null,
+           v_rest_status[r.i]
+      from (select g.i,
+                   time '06:00' + floor(random() * 360)::int * interval '1 minute' as work_start,
+                   1 + floor(random() * 100)::int as len_name,
+                   1 + floor(random() * 200)::int as len_description,
+                   1 + floor(random() * 200)::int as len_details
+              from generate_series(1, value) as g(i)) as r;
+
+    -- -----------------------------------------------------------------------
+    -- 5. Клиенты (value). Логин (1..50 букв) и телефон уникальны (BR-2.2):
+    --    строки с совпавшим логином или телефоном пропускаются и
+    --    довставляются заново. Пароль — md5 (BR-2.3).
+    -- -----------------------------------------------------------------------
+    v_try := 0;
+    while cardinality(v_client) < value loop
+        v_try := v_try + 1;
+        if v_try > 1000 then
+            raise exception 'insert_test_data: не удалось подобрать % уникальных логинов и телефонов',
+                value - cardinality(v_client);
+        end if;
+
+        with ins as (
+            insert into client (client_id, login, password, phone_number)
+            select exts.uuid_generate_v4(),
+                   (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                      from generate_series(1, c.len)),
+                   md5(random()::text),
+                   '+79' || lpad(floor(random() * 1000000000)::bigint::text, 9, '0')
+              from (select 1 + floor(random() * 50)::int as len
+                      from generate_series(1, value - cardinality(v_client))) as c
+            on conflict do nothing
+            returning client_id
+        )
+        select v_client || coalesce(array_agg(client_id), '{}')
+          into v_client
+          from ins;
     end loop;
 
     -- -----------------------------------------------------------------------
-    -- 4. Рестораны (value): у каждого свой адрес из первых value (BR-3.3).
-    --    Время закрытия позже открытия (BR-4.4): открытие 06:00..11:59,
-    --    работа 8..12 часов, поэтому закрытие не позже 23:59.
+    -- 6. Адреса клиентов (BR-2.4, BR-2.5): у клиента i четыре своих адреса
+    --    v_addr[value + i + value * k], k = 0..3; около 20% клиентов
+    --    дополнительно пользуются первым адресом соседа (клиента i % value + 1),
+    --    который у клиента i ещё не привязан. Дубли пары исключает PK.
     -- -----------------------------------------------------------------------
-    select count(*) into v_base from restaurant;
-    for i in 1..value loop
-        v_start_time := time '06:00' + floor(random() * 360)::int * interval '1 minute';
-        insert into restaurant (restaurant_id, restaurant_name, address_id, description,
-                                work_start, work_end, company_details, rating, status)
-        values (exts.uuid_generate_v4(),
-                c_rest_names[1 + floor(random() * cardinality(c_rest_names))::int]
-                    || ' «' || c_surnames[1 + floor(random() * cardinality(c_surnames))::int] || '»'
-                    || ' №' || (v_base + i)::text,
-                v_addr[i],
-                'Доставка домашней кухни, ресторан-партнёр FoodExpress',
-                v_start_time,
-                v_start_time + (8 + floor(random() * 5))::int * interval '1 hour',
-                'ИНН ' || lpad(floor(random() * 1e10)::bigint::text, 10, '0')
-                    || ', ОГРН ' || lpad(floor(random() * 1e13)::bigint::text, 13, '0')
-                    || ', р/с 40702810' || lpad(floor(random() * 1e12)::bigint::text, 12, '0'),
-                null,
-                case when random() < 0.9 then 'активен'::restaurant_status
-                     else v_rest_st[1 + floor(random() * cardinality(v_rest_st))::int]
-                end)
-        returning restaurant_id into v_id;
-        v_rest := v_rest || v_id;
-    end loop;
+    insert into client_address (client_id, address_id)
+    select v_client[1 + (g.i - 1) % value], v_addr[value + g.i]
+      from generate_series(1, value * 4) as g(i);
 
-    -- -----------------------------------------------------------------------
-    -- 5. Клиенты (value). Логин и телефон уникальны (BR-2.2),
-    --    пароль — md5 (BR-2.3).
-    -- -----------------------------------------------------------------------
-    select count(*) into v_base from client;
-    for i in 1..value loop
-        loop
-            v_text := '+79' || lpad(floor(random() * 1000000000)::bigint::text, 9, '0');
-            exit when not exists (select 1 from client where phone_number = v_text);
-        end loop;
-        insert into client (client_id, login, password, phone_number)
-        values (exts.uuid_generate_v4(),
-                'user_' || left(md5(random()::text), 6) || '_' || (v_base + i)::text,
-                md5(random()::text),
-                v_text)
-        returning client_id into v_id;
-        v_client := v_client || v_id;
-    end loop;
+    select array_agg(value > 1 and random() < 0.2 order by g.i)
+      into v_extra
+      from generate_series(1, value) as g(i);
 
-    -- -----------------------------------------------------------------------
-    -- 6. Адреса клиентов (BR-2.4, BR-2.5): клиентские адреса раздаются по
-    --    кругу (у каждого клиента 4 адреса), часть клиентов дополнительно
-    --    пользуется адресом соседа. Дубли пары исключает PK.
-    --    Адреса клиента i: v_addr[value + i + value * k], k = 0..3,
-    --    и v_extra_addr[i], если он есть, — из них выбирается адрес заказа.
-    -- -----------------------------------------------------------------------
-    for i in 1..value * 4 loop
-        insert into client_address (client_id, address_id)
-        values (v_client[1 + (i - 1) % value], v_addr[value + i]);
-    end loop;
-
-    v_extra_addr := array_fill(null::uuid, array[value]);
-    if value > 1 then
-        for i in 1..value loop
-            if random() < 0.2 then
-                -- адрес соседа (клиента i % value + 1) у клиента i ещё не привязан
-                insert into client_address (client_id, address_id)
-                values (v_client[i], v_addr[value + 1 + (i % value)]);
-                v_extra_addr[i] := v_addr[value + 1 + (i % value)];
-            end if;
-        end loop;
-    end if;
+    insert into client_address (client_id, address_id)
+    select v_client[g.i], v_addr[value + 1 + g.i % value]
+      from generate_series(1, value) as g(i)
+     where v_extra[g.i];
 
     -- -----------------------------------------------------------------------
     -- 7. Блюда (value * 5): блюдо j принадлежит ресторану ((j - 1) % value) + 1,
-    --    так у каждого ресторана ровно 5 блюд. Цена 100..1500 (BR-5.3).
+    --    так у каждого ресторана ровно 5 блюд: j = r + value * k, k = 0..4.
+    --    Цена 100..1500 (BR-5.3), не нулевая — на ней держится добавка до
+    --    минимальной суммы заказа (раздел 8). Блюдо k = 0 всегда доступно —
+    --    с него начинается незавершённый заказ.
+    --    Название блюда k — 20k + 1 .. 20k + 20 букв: у пяти блюд ресторана
+    --    разная длина названия, значит, и названия разные, а вместе длины
+    --    покрывают весь диапазон 1..100. Описание — 1..200 букв.
     -- -----------------------------------------------------------------------
-    for j in 1..value * 5 loop
-        insert into product (product_id, product_name, product_category_id, price,
-                             restaurant_id, photo_url, rating, status, description)
-        values (exts.uuid_generate_v4(),
-                c_dishes[1 + floor(random() * cardinality(c_dishes))::int],
-                v_cat[1 + floor(random() * value)::int],
-                (10 + floor(random() * 141)) * 10,
-                v_rest[1 + (j - 1) % value],
-                case when random() < 0.3 then null
-                     else 'https://cdn.foodexpress.ru/img/' || md5(random()::text) || '.jpg' end,
-                null,
-                case when random() < 0.8 then 'доступно'::product_status
-                     else (enum_range(null::product_status))
-                          [1 + floor(random() * cardinality(enum_range(null::product_status)))::int]
-                end,
-                'Фирменное блюдо, вес ' || (200 + floor(random() * 300))::int || ' г')
-        returning product_id, price into v_id, v_price;
-        v_prod := v_prod || v_id;
-        v_prod_price := v_prod_price || v_price;
-    end loop;
+    select array_agg(p.id order by p.j),
+           array_agg(p.price order by p.j),
+           array_agg(p.status order by p.j)
+      into v_prod, v_price, v_prod_status
+      from (select g.j,
+                   exts.uuid_generate_v4() as id,
+                   ((10 + floor(random() * 141)) * 10)::int as price,
+                   case when g.j <= value or random() < 0.8 then 'доступно'::product_status
+                        else v_prod_st[1 + floor(random() * cardinality(v_prod_st))::int]
+                   end as status
+              from generate_series(1, value * 5) as g(j)) as p;
+
+    insert into product (product_id, product_name, product_category_id, price,
+                         restaurant_id, photo_url, rating, status, description)
+    select v_prod[p.j],
+           (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+              from generate_series(1, p.len_name)),
+           v_cat[1 + floor(random() * value)::int],
+           v_price[p.j],
+           v_rest[1 + (p.j - 1) % value],
+           case when random() < 0.3 then null
+                else 'https://cdn.foodexpress.ru/img/' || md5(random()::text) || '.jpg'
+           end,
+           null,
+           v_prod_status[p.j],
+           (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+              from generate_series(1, p.len_description))
+      from (select g.j,
+                   1 + ((g.j - 1) / value) * 20 + floor(random() * 20)::int as len_name,
+                   1 + floor(random() * 200)::int as len_description
+              from generate_series(1, value * 5) as g(j)) as p;
 
     -- -----------------------------------------------------------------------
-    -- 8. Заказы (value * 5) с составом, оплатой и отзывом.
+    -- 8. Заказы (value * 5) с составом, оплатой и отзывами — пакетами по
+    --    c_chunk заказов. Номер заказа i; заказы с i % 5 in (1, 2) — всегда
+    --    доставлены (40% каждого пакета), чтобы отзывов хватило (8.3).
     -- -----------------------------------------------------------------------
-    for i in 1..value * 5 loop
-        v_ci := 1 + floor(random() * value)::int;
-        v_ri := 1 + floor(random() * value)::int;
-        v_ki := 1 + floor(random() * value)::int;
+    for v_from in 1 .. value * 5 by c_chunk loop
 
-        -- адрес доставки — один из адресов клиента (BR-7.4), по случайному
-        -- индексу из массива адресов, без запроса к client_address
-        v_ai := floor(random() * (4 + (v_extra_addr[v_ci] is not null)::int))::int;
-        v_order_addr := case
-                            when v_ai = 4 then v_extra_addr[v_ci]
-                            else v_addr[value + v_ci + value * v_ai]
-                        end;
-
-        -- статус: у уволенного курьера заказы только завершённые
-        if v_cour_fired[v_ki] then
-            v_order_st := case
-                              when random() < 0.85 then 'доставлен'::order_status
-                              else v_order_done[1 + floor(random() * cardinality(v_order_done))::int]
-                          end;
-        elsif random() < 0.7 then
-            v_order_st := 'доставлен';
-        else
-            v_order_st := v_order_all[1 + floor(random() * cardinality(v_order_all))::int];
-        end if;
-
-        -- время заказа — в период работы курьера (не раньше найма и не позже увольнения),
-        -- незавершённые заказы — за последние 2 часа
-        if v_order_st = any (v_order_open) then
-            v_order_ts := greatest(v_cour_start[v_ki],
-                                   localtimestamp - random() * interval '2 hours');
-        else
-            v_order_ts := v_cour_start[v_ki]
-                          + random() * (v_cour_end[v_ki] - v_cour_start[v_ki]);
-        end if;
-        v_order_ts := date_trunc('second', v_order_ts);
-
-        -- время доставки только у доставленных (BR-7.12), не раньше создания (BR-7.13)
-        if v_order_st = 'доставлен' then
-            v_deliv_ts := least(v_order_ts + (20 + floor(random() * 100))::int * interval '1 minute',
-                                date_trunc('second', localtimestamp));
-        else
-            v_deliv_ts := null;
-        end if;
-
-        -- состав: 1..3 разных блюда ресторана заказа (BR-7.3, BR-7.16).
-        -- Индексы 5 блюд ресторана перемешиваются в массиве (Фишер — Йетс),
-        -- берутся первые v_n_items — без повторов и без запросов к таблицам.
-        v_n_items := 1 + floor(random() * 3)::int;
-        v_items := array[v_ri, v_ri + value, v_ri + value * 2, v_ri + value * 3, v_ri + value * 4];
-        for j in reverse 5..2 loop
-            v_ai := 1 + floor(random() * j)::int;
-            v_swap := v_items[j];
-            v_items[j] := v_items[v_ai];
-            v_items[v_ai] := v_swap;
-        end loop;
-        v_items := v_items[1:v_n_items];
-
-        v_qty := '{}';
-        v_amount := 0;
-        for j in 1..v_n_items loop
-            v_qty := v_qty || (1 + floor(random() * 3))::numeric;
-            v_amount := v_amount + v_prod_price[v_items[j]] * v_qty[j];
-        end loop;
-
-        -- общая сумма не меньше 1000 (BR-1.8): докладываем количество первого блюда
-        while round(v_amount * 1.10, 2) < 1000 loop
-            v_qty[1] := v_qty[1] + 1;
-            v_amount := v_amount + v_prod_price[v_items[1]];
-        end loop;
-
-        insert into "order" (order_id, courier_id, client_id, address_id, restaurant_id,
-                             order_timestamp, delivery_timestamp, order_amount,
-                             status, pay_status, description)
-        values (exts.uuid_generate_v4(), v_cour[v_ki], v_client[v_ci], v_order_addr, v_rest[v_ri],
-                v_order_ts, v_deliv_ts, v_amount,
-                v_order_st, 'ожидает',
-                c_order_notes[1 + floor(random() * cardinality(c_order_notes))::int])
-        returning order_id into v_order_id;
-
-        for j in 1..v_n_items loop
+        -- 8.1. Заказы и состав одним оператором.
+        --   ord  — клиент, курьер, статус: у уволенного курьера заказы только
+        --          завершённые;
+        --   ord2 — ресторан (для незавершённых — только активный), номер
+        --          адреса клиента (BR-7.4: k = 0..3 — свои, 4 — соседский),
+        --          время заказа в периоде работы курьера (незавершённые —
+        --          за последние 2 часа), параметры состава;
+        --   items — 1..3 разных блюда ресторана заказа (BR-7.3, BR-7.16):
+        --          позиция t берёт блюдо k = (s0 + t * step) % 5; step = 1..4
+        --          взаимно прост с 5, поэтому k не повторяются — без
+        --          перемешивания и без запросов к таблицам. У незавершённого
+        --          заказа s0 = 0 (первое блюдо — всегда доступное k = 0),
+        --          недоступные блюда в него не попадают;
+        --   amounts — сумма Σ(цена × количество) и цена первого блюда.
+        --          Общая сумма не меньше 1000 (BR-1.8): при сумме блюд
+        --          от 910 общая сумма = сумма + 10% ≥ 1001. Недостающее
+        --          добирается количеством первого блюда по замкнутой формуле
+        --          ceil((910 - сумма) / цена), без цикла. Цена блюда
+        --          генератора не меньше 100; при нулевой цене nullif даёт
+        --          NULL, добавка 0, и заказ отклонит CHECK order_total_min_chk,
+        --          а не бесконечный цикл.
+        --   order_amount = Σ по составу с учётом добавки (BR-7.10).
+        --   Оплата в этом же пакете будет успешной, поэтому pay_status
+        --   сразу 'оплачен'; триггер payment_pay_status при вставке оплаты
+        --   получает то же значение и строку заказа не переписывает.
+        with ord as materialized (
+            select c.i, c.ci, c.ki,
+                   exts.uuid_generate_v4() as order_id,
+                   case
+                       when c.i % 5 in (1, 2) then 'доставлен'::order_status
+                       when v_cour_fired[c.ki] then
+                           case when random() < 0.85 then 'доставлен'::order_status
+                                else v_order_done[1 + floor(random() * cardinality(v_order_done))::int]
+                           end
+                       when random() < 0.6 then 'доставлен'::order_status
+                       else v_order_all[1 + floor(random() * cardinality(v_order_all))::int]
+                   end as status
+              from (select g.i,
+                           1 + floor(random() * value)::int as ci,
+                           1 + floor(random() * value)::int as ki
+                      from generate_series(v_from, least(v_from + c_chunk - 1, value * 5)) as g(i)) as c
+        ),
+        ord2 as materialized (
+            select o.*,
+                   o.status < 'доставлен' as is_open,
+                   case when o.status < 'доставлен'
+                        then v_rest_act[1 + floor(random() * cardinality(v_rest_act))::int]
+                        else 1 + floor(random() * value)::int
+                   end as ri,
+                   floor(random() * (4 + v_extra[o.ci]::int))::int as addr_i,
+                   1 + floor(random() * 3)::int as n_items,
+                   case when o.status < 'доставлен' then 0 else floor(random() * 5)::int end as s0,
+                   1 + floor(random() * 4)::int as step,
+                   date_trunc('second',
+                       case when o.status < 'доставлен'
+                            then greatest(v_cour_start[o.ki],
+                                          localtimestamp - random() * interval '2 hours')
+                            else v_cour_start[o.ki]
+                                 + random() * (v_cour_end[o.ki] - v_cour_start[o.ki])
+                       end) as order_ts,
+                   1 + floor(random() * 200)::int as len_description
+              from ord as o
+        ),
+        items as materialized (
+            select o.order_id, o.ri, t.t,
+                   o.ri + value * ((o.s0 + t.t * o.step) % 5) as pj,
+                   1 + floor(random() * 3)::int as qty
+              from ord2 as o
+             cross join generate_series(0, 2) as t(t)
+             where t.t < o.n_items
+               and (t.t = 0
+                    or not o.is_open
+                    or v_prod_status[o.ri + value * ((o.s0 + t.t * o.step) % 5)] = 'доступно')
+        ),
+        amounts as materialized (
+            select s.order_id, s.first_price,
+                   greatest(0, ceil((910 - s.amount) / nullif(s.first_price, 0)))::int as add_qty,
+                   s.amount
+              from (select i.order_id,
+                           sum(v_price[i.pj] * i.qty)::numeric        as amount,
+                           min(v_price[i.pj]) filter (where i.t = 0)  as first_price
+                      from items as i
+                     group by i.order_id) as s
+        ),
+        ins_order as (
+            insert into "order" (order_id, courier_id, client_id, address_id, restaurant_id,
+                                 order_timestamp, delivery_timestamp, order_amount,
+                                 status, pay_status, description)
+            select o.order_id,
+                   v_cour[o.ki],
+                   v_client[o.ci],
+                   case when o.addr_i = 4 then v_addr[value + 1 + o.ci % value]
+                        else v_addr[value + o.ci + value * o.addr_i]
+                   end,
+                   v_rest[o.ri],
+                   o.order_ts,
+                   -- время доставки только у доставленных (BR-7.12), не раньше создания (BR-7.13)
+                   case when o.status = 'доставлен'
+                        then least(o.order_ts + (20 + floor(random() * 100))::int * interval '1 minute',
+                                   date_trunc('second', localtimestamp))
+                   end,
+                   a.amount + a.add_qty * a.first_price,
+                   o.status,
+                   'оплачен',
+                   (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                      from generate_series(1, o.len_description))
+              from ord2 as o
+              join amounts as a on a.order_id = o.order_id
+            returning order_id
+        ),
+        ins_structure as (
             insert into order_structure (order_id, product_id, restaurant_id, quantity)
-            values (v_order_id, v_prod[v_items[j]], v_rest[v_ri], v_qty[j]);
+            select i.order_id,
+                   v_prod[i.pj],
+                   v_rest[i.ri],
+                   i.qty + case when i.t = 0 then a.add_qty else 0 end
+              from items as i
+              join amounts as a on a.order_id = i.order_id
+        )
+        select array_agg(order_id) into v_ord from ins_order;
+
+        -- 8.2. Оплата: одна попытка на заказ, и она успешная — у каждого заказа
+        --      ровно одна успешная оплата (BR-8.1), а строк payment ровно
+        --      value * 5 (BR-11.7). Сумма = total_amount (BR-8.4).
+        --      Предоплата: заказ в любом статусе (и 'создан') уже оплачен.
+        --      Идентификатор транзакции — 64 hex-символа из двух md5; при
+        --      совпадении с существующим попытка пропускается и довставляется.
+        v_cnt := 0;
+        v_try := 0;
+        while v_cnt < cardinality(v_ord) loop
+            v_try := v_try + 1;
+            if v_try > 100 then
+                raise exception 'insert_test_data: не удалось подобрать уникальные идентификаторы транзакций';
+            end if;
+
+            insert into payment (payment_id, order_id, payment_type, amount, transaction_ref,
+                                 transaction_timestamp, status)
+            select exts.uuid_generate_v4(),
+                   o.order_id,
+                   v_pay_types[1 + floor(random() * cardinality(v_pay_types))::int],
+                   o.total_amount,
+                   md5(random()::text) || md5(random()::text),
+                   least(o.order_timestamp + (1 + floor(random() * 10))::int * interval '1 minute',
+                         date_trunc('second', localtimestamp)),
+                   'успех'::payment_status
+              from unnest(v_ord) as u(order_id)
+              join "order" as o on o.order_id = u.order_id
+             where v_try = 1
+                or not exists (select 1 from payment p where p.order_id = o.order_id)
+            on conflict (transaction_ref) do nothing;
+
+            get diagnostics v_added = row_count;
+            v_cnt := v_cnt + v_added;
         end loop;
 
-        -- оплата: одна попытка на заказ, и она успешная — у каждого заказа
-        -- ровно одна успешная оплата (BR-8.1), а строк payment ровно
-        -- value * 5 (BR-11.7). Сумма = total_amount (BR-8.4).
-        -- Предоплата: заказ в любом статусе (и 'создан') уже оплачен.
-        -- order.pay_status = 'оплачен' выставляет триггер payment_pay_status (BR-8.7).
-        insert into payment (payment_id, order_id, payment_type, amount, transaction_ref,
-                             transaction_timestamp, status)
-        select exts.uuid_generate_v4(), o.order_id,
-               (enum_range(null::payment_type))
-                   [1 + floor(random() * cardinality(enum_range(null::payment_type)))::int],
-               o.total_amount,
-               'TX-' || replace(exts.uuid_generate_v4()::text, '-', ''),
-               least(o.order_timestamp + (1 + floor(random() * 10))::int * interval '1 minute',
-                     date_trunc('second', localtimestamp)),
-               'успех'::payment_status
-          from "order" o
-         where o.order_id = v_order_id;
-
-        -- отзыв: на блюдо из этого заказа, ресторан заказа или сам заказ (BR-9.1, BR-9.2)
-        v_entity_type := (enum_range(null::review_entity_type))
-                         [1 + floor(random() * cardinality(enum_range(null::review_entity_type)))::int];
-        v_entity_id := case v_entity_type
-                           when 'блюдо'    then v_prod[v_items[1 + floor(random() * v_n_items)::int]]
-                           when 'ресторан' then v_rest[v_ri]
-                           else v_order_id
-                       end;
-
+        -- 8.3. Отзывы — только на доставленные заказы, столько же, сколько
+        --      заказов в пакете (value * 5 в сумме). Кандидаты: сам заказ,
+        --      ресторан заказа и каждое блюдо состава (BR-9.1, BR-9.2), не
+        --      больше одного отзыва на объект в заказе (BR-9.5). Сначала
+        --      каждый доставленный заказ получает отзыв случайного типа
+        --      (enum_range), затем недостающее количество добирается вторыми
+        --      отзывами на другие объекты тех же заказов. Доставлено не
+        --      меньше 40% пакета, у каждого не меньше трёх объектов, поэтому
+        --      кандидатов всегда больше, чем нужно отзывов.
         insert into review (review_id, client_id, review_timestamp, entity_id, entity_type,
                             order_id, description, photo_url, rating)
-        values (exts.uuid_generate_v4(), v_client[v_ci],
-                least(coalesce(v_deliv_ts, v_order_ts)
-                          + (1 + floor(random() * 48))::int * interval '1 hour',
-                      greatest(v_order_ts, date_trunc('second', localtimestamp))),
-                v_entity_id, v_entity_type, v_order_id,
-                c_review_txt[1 + floor(random() * cardinality(c_review_txt))::int],
-                case when random() < 0.5 then null
-                     else 'https://cdn.foodexpress.ru/review/' || md5(random()::text) || '.jpg' end,
-                1 + floor(random() * 5)::int);
+        select exts.uuid_generate_v4(),
+               c.client_id,
+               least(c.delivery_timestamp + (1 + floor(random() * 48))::int * interval '1 hour',
+                     date_trunc('second', localtimestamp)),
+               c.entity_id,
+               c.entity_type,
+               c.order_id,
+               (select string_agg(chr(1072 + floor(random() * 32)::int), '')
+                  from generate_series(1, c.len_description)),
+               case when random() < 0.5 then null
+                    else 'https://cdn.foodexpress.ru/review/' || md5(random()::text) || '.jpg'
+               end,
+               1 + floor(random() * 5)::int
+          from (select x.*,
+                       row_number() over (partition by x.order_id
+                                          order by x.entity_type <> x.first_type, x.rnd) as rn,
+                       1 + floor(random() * 200)::int as len_description
+                  from (select o.order_id, o.client_id, o.delivery_timestamp, o.first_type,
+                               e.entity_type, e.entity_id, random() as rnd
+                          from (select oo.*,
+                                       v_rev_types[1 + floor(random() * cardinality(v_rev_types))::int]
+                                           as first_type
+                                  from unnest(v_ord) as u(order_id)
+                                  join "order" as oo on oo.order_id = u.order_id
+                                 where oo.status = 'доставлен') as o
+                         cross join lateral (
+                                   select 'заказ'::review_entity_type, o.order_id
+                                   union all
+                                   select 'ресторан'::review_entity_type, o.restaurant_id
+                                   union all
+                                   select 'блюдо'::review_entity_type, os.product_id
+                                     from order_structure as os
+                                    where os.order_id = o.order_id
+                               ) as e(entity_type, entity_id)
+                       ) as x
+               ) as c
+         order by c.rn, c.rnd
+         limit cardinality(v_ord);
+
+        get diagnostics v_added = row_count;
+        if v_added <> cardinality(v_ord) then
+            raise exception 'insert_test_data: отзывов % вместо %', v_added, cardinality(v_ord);
+        end if;
     end loop;
 
     -- -----------------------------------------------------------------------
     -- 9. Рейтинги блюд и ресторанов этой порции = среднее по отзывам,
     --    NULL если отзывов нет (BR-9.6, BR-9.7). Считаются здесь одним
-    --    UPDATE, а не триггером rating_change на каждый отзыв. Флаг пропуска
-    --    снимается, чтобы дальнейшие изменения отзывов в этой же транзакции
-    --    снова пересчитывали рейтинг.
+    --    UPDATE на таблицу, а не триггером rating_change на каждый отзыв.
+    --    Отзывы порции ссылаются только на блюда и рестораны порции, у
+    --    которых до этого рейтинга не было, — блюда без отзывов остаются NULL.
+    --    Флаг пропуска снимается, чтобы дальнейшие изменения отзывов в этой
+    --    же транзакции снова пересчитывали рейтинг.
     -- -----------------------------------------------------------------------
     perform set_config('kalugin_food.skip_rating', 'off', true);
 
     update product p
-       set rating = (select round(avg(r.rating), 2)
-                       from review r
-                      where r.entity_type = 'блюдо'
-                        and r.entity_id = p.product_id)
-     where p.product_id = any (v_prod);
+       set rating = r.avg_rating
+      from (select rv.entity_id, round(avg(rv.rating), 2) as avg_rating
+              from review rv
+              join unnest(v_prod) as u(product_id) on u.product_id = rv.entity_id
+             where rv.entity_type = 'блюдо'
+             group by rv.entity_id) as r
+     where p.product_id = r.entity_id;
 
     update restaurant rs
-       set rating = (select round(avg(r.rating), 2)
-                       from review r
-                      where r.entity_type = 'ресторан'
-                        and r.entity_id = rs.restaurant_id)
-     where rs.restaurant_id = any (v_rest);
+       set rating = r.avg_rating
+      from (select rv.entity_id, round(avg(rv.rating), 2) as avg_rating
+              from review rv
+              join unnest(v_rest) as u(restaurant_id) on u.restaurant_id = rv.entity_id
+             where rv.entity_type = 'ресторан'
+             group by rv.entity_id) as r
+     where rs.restaurant_id = r.entity_id;
 
     -- -----------------------------------------------------------------------
-    -- 10. Выплаты курьерам за последние 6 месяцев (BR-10.2, BR-10.7).
-    --     Идём от старого месяца к текущему: в первом месяце действует
-    --     начальный коэффициент 0.1 (BR-6.5); выплата = коэффициент месяца ×
-    --     сумма комиссий доставленных заказов курьера за месяц (по дате заказа);
-    --     коэффициент следующего месяца — по числу доставок.
-    --     После текущего месяца courier.coefficient = коэффициент на следующий
-    --     месяц; уволенным он не назначается (BR-10.6).
+    -- 10. Выплаты курьерам за последние 6 месяцев (BR-10.2, BR-10.7) —
+    --     по каждому курьеру порции и каждому месяцу, даже без доставок.
+    --     cnt и comm — число и сумма комиссий доставленных заказов курьера
+    --     за месяц (по дате заказа). Коэффициент месяца: в первом месяце
+    --     начальный 0.1 (BR-6.5), дальше — по числу доставок предыдущего
+    --     месяца (lag). Выплата = коэффициент месяца × сумма комиссий.
+    --     courier.coefficient — коэффициент на следующий месяц по доставкам
+    --     текущего; уволенным он не назначается (BR-10.6), у них остаётся
+    --     коэффициент текущего месяца.
     -- -----------------------------------------------------------------------
-    for i in 1..value loop
-        v_coef := 0.1;
-        v_last_coef := 0.1;
-
-        for v_rec in
-            select m.mon,
-                   count(o.order_id)              as cnt,
-                   coalesce(sum(o.commission), 0) as commission_sum
-              from generate_series(v_pay_start::timestamp,
-                                   date_trunc('month', current_date),
-                                   interval '1 month') as m(mon)
-              left join "order" o
-                     on o.courier_id = v_cour[i]
-                    and o.status = 'доставлен'
-                    and o.order_timestamp >= m.mon
-                    and o.order_timestamp <  m.mon + interval '1 month'
-             group by m.mon
-             order by m.mon
-        loop
-            insert into courier_pay (year, month, courier_id, amount, coefficient_used)
-            values (extract(year from v_rec.mon)::int,
-                    extract(month from v_rec.mon)::int,
-                    v_cour[i],
-                    round(v_coef * v_rec.commission_sum, 2),
-                    v_coef);
-
-            v_last_coef := v_coef;
-            v_coef := case
-                          when v_rec.cnt > 500 then 0.5
-                          when v_rec.cnt > 250 then 0.3
-                          when v_rec.cnt > 150 then 0.2
-                          else 0.1
-                      end;
-        end loop;
-
-        update courier
-           set coefficient = case when v_cour_fired[i] then v_last_coef else v_coef end
-         where courier_id = v_cour[i];
-    end loop;
+    with delivered as (
+        select o.courier_id,
+               date_trunc('month', o.order_timestamp) as mon,
+               count(*)          as cnt,
+               sum(o.commission) as comm
+          from unnest(v_cour) as u(courier_id)
+          join "order" as o on o.courier_id = u.courier_id
+         where o.status = 'доставлен'
+         group by o.courier_id, date_trunc('month', o.order_timestamp)
+    ),
+    grid as (
+        select u.courier_id, u.fired, m.mon,
+               coalesce(d.cnt, 0)  as cnt,
+               coalesce(d.comm, 0) as comm,
+               lag(coalesce(d.cnt, 0)) over (partition by u.courier_id order by m.mon) as prev_cnt
+          from unnest(v_cour, v_cour_fired) as u(courier_id, fired)
+         cross join generate_series(v_pay_start::timestamp,
+                                    date_trunc('month', current_date),
+                                    interval '1 month') as m(mon)
+          left join delivered as d on d.courier_id = u.courier_id and d.mon = m.mon
+    ),
+    pay as (
+        select g.*,
+               case
+                   when g.prev_cnt is null then 0.1
+                   when g.prev_cnt > 500 then 0.5
+                   when g.prev_cnt > 250 then 0.3
+                   when g.prev_cnt > 150 then 0.2
+                   else 0.1
+               end as coef_used,
+               case
+                   when g.cnt > 500 then 0.5
+                   when g.cnt > 250 then 0.3
+                   when g.cnt > 150 then 0.2
+                   else 0.1
+               end as coef_next
+          from grid as g
+    ),
+    ins_pay as (
+        insert into courier_pay (year, month, courier_id, amount, coefficient_used)
+        select extract(year from p.mon)::int,
+               extract(month from p.mon)::int,
+               p.courier_id,
+               round(p.coef_used * p.comm, 2),
+               p.coef_used
+          from pay as p
+    )
+    update courier c
+       set coefficient = case when p.fired then p.coef_used else p.coef_next end
+      from pay as p
+     where p.mon = date_trunc('month', current_date)
+       and c.courier_id = p.courier_id;
 end;
 $$;
