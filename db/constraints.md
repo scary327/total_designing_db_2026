@@ -94,9 +94,10 @@ UNIQUE (product_id, restaurant_id) — составной FK требует ун
 Если ресторан блюда отличается от ресторана заказа, хотя бы один из двух FK
 не сойдётся, и строка не вставится.
 
-Почему не нарушается 3НФ: restaurant_id здесь — часть ссылочной целостности.
-Его значение не хранится «просто так»: оно жёстко сверено FK и с заказом, и с
-блюдом, поэтому оно не может разойтись с ними (нет аномалий обновления).
+Нормализация: restaurant_id здесь — контролируемая избыточность (формально
+он зависит от части ключа, см. раздел «Нормализация»). Его значение не
+хранится «просто так»: оно жёстко сверено FK и с заказом, и с блюдом, поэтому
+не может разойтись с ними (нет аномалий обновления).
 Выбран декларативный способ вместо триггера: проще, быстрее и не обходится.
 ```
 
@@ -191,25 +192,28 @@ entity_type и entity_id, а проверку «блюдо из этого за�
 | `client_address` | `client_id` | `client(client_id)` `ON DELETE CASCADE` | BR-2.4 | Связь клиента с его адресами; при удалении клиента связь удаляется, сам адрес — нет (BR-3.5) |
 | `client_address` | `address_id` | `address(address_id)` `ON DELETE RESTRICT` | BR-2.4, BR-3.5 | Адрес не удаляется, пока используется |
 | `restaurant` | `address_id` | `address(address_id)` `ON DELETE RESTRICT` | BR-3.3, BR-3.5 | У ресторана ровно один адрес; адрес не удаляется |
-| `courier_pay` | `courier_id` | `courier(courier_id)` | BR-10.2 | Выплата начисляется конкретному курьеру |
-| `product` | `product_category_id` | `product_category(product_category_id)` | BR-5.1, BR-5.7 | Блюдо принадлежит ровно одной категории из справочника |
-| `product` | `restaurant_id` | `restaurant(restaurant_id)` | BR-5.1 | Блюдо принадлежит ровно одному ресторану |
-| `"order"` | `client_id` | `client(client_id)` | BR-7.1, BR-7.2 | Заказ оформляет клиент |
-| `"order"` | `restaurant_id` | `restaurant(restaurant_id)` | BR-7.2 | Заказ привязан к одному ресторану |
-| `"order"` | `courier_id` | `courier(courier_id)` | BR-7.5 | Доставку выполняет курьер |
+| `courier_pay` | `courier_id` | `courier(courier_id)` `ON DELETE RESTRICT` | BR-10.2 | Выплата начисляется конкретному курьеру; курьер с историей выплат не удаляется |
+| `product` | `product_category_id` | `product_category(product_category_id)` `ON DELETE RESTRICT` | BR-5.1, BR-5.7 | Блюдо принадлежит ровно одной категории из справочника; категория с блюдами не удаляется |
+| `product` | `restaurant_id` | `restaurant(restaurant_id)` `ON DELETE RESTRICT` | BR-5.1 | Блюдо принадлежит ровно одному ресторану |
+| `"order"` | `client_id` | `client(client_id)` `ON DELETE RESTRICT` | BR-7.1, BR-7.2 | Заказ оформляет клиент; клиент с заказами не удаляется |
+| `"order"` | `restaurant_id` | `restaurant(restaurant_id)` `ON DELETE RESTRICT` | BR-7.2 | Заказ привязан к одному ресторану |
+| `"order"` | `courier_id` | `courier(courier_id)` `ON DELETE RESTRICT` | BR-7.5 | Доставку выполняет курьер |
 | `"order"` | `address_id` | `address(address_id)` `ON DELETE RESTRICT` | BR-7.4, BR-3.5 | Заказ доставляется по одному адресу; история заказов сохраняется |
-| `"order"` | `(client_id, address_id)` | `client_address(client_id, address_id)` | BR-7.4 | Адрес доставки — один из адресов этого клиента (ловушка 2) |
+| `"order"` | `(client_id, address_id)` | `client_address(client_id, address_id)` `ON DELETE RESTRICT` | BR-7.4 | Адрес доставки — один из адресов этого клиента (ловушка 2); адрес, по которому были заказы, нельзя отвязать от клиента |
 | `payment` | `order_id` | `"order"(order_id)` `ON DELETE CASCADE` | BR-8.1 | Попытка оплаты относится к заказу |
 | `payment` | `(order_id, amount)` | `"order"(order_id, total_amount)` `ON DELETE CASCADE` | BR-8.4 | Сумма попытки оплаты равна общей сумме заказа |
 | `order_structure` | `order_id` | `"order"(order_id)` `ON DELETE CASCADE` | BR-7.14 | Позиция принадлежит заказу |
-| `order_structure` | `product_id` | `product(product_id)` | BR-7.14 | Позиция — это блюдо |
-| `order_structure` | `(order_id, restaurant_id)` | `"order"(order_id, restaurant_id)` | BR-7.3 | Ресторан позиции = ресторан заказа (ловушка 3) |
-| `order_structure` | `(product_id, restaurant_id)` | `product(product_id, restaurant_id)` | BR-7.3 | Ресторан позиции = ресторан блюда (ловушка 3) |
-| `review` | `client_id` | `client(client_id)` | BR-9.1 | Отзыв оставляет клиент |
-| `review` | `order_id` | `"order"(order_id)` | BR-9.2 | Отзыв всегда связан с конкретным заказом |
-| `review` | `(order_id, client_id)` | `"order"(order_id, client_id)` | BR-9.2 | Отзыв только на свой заказ (ловушка 4) |
+| `order_structure` | `product_id` | `product(product_id)` `ON DELETE RESTRICT` | BR-7.14 | Позиция — это блюдо; блюдо из истории заказов не удаляется (для этого есть статус `архив`) |
+| `order_structure` | `(order_id, restaurant_id)` | `"order"(order_id, restaurant_id)` `ON DELETE CASCADE` | BR-7.3 | Ресторан позиции = ресторан заказа (ловушка 3) |
+| `order_structure` | `(product_id, restaurant_id)` | `product(product_id, restaurant_id)` `ON DELETE RESTRICT` | BR-7.3 | Ресторан позиции = ресторан блюда (ловушка 3) |
+| `review` | `client_id` | `client(client_id)` `ON DELETE CASCADE` | BR-9.1 | Отзыв оставляет клиент |
+| `review` | `order_id` | `"order"(order_id)` `ON DELETE CASCADE` | BR-9.2 | Отзыв всегда связан с конкретным заказом |
+| `review` | `(order_id, client_id)` | `"order"(order_id, client_id)` `ON DELETE CASCADE` | BR-9.2 | Отзыв только на свой заказ (ловушка 4) |
 
-Итого 20 FK. Действия `ON DELETE` не указаны (= `NO ACTION`) там, где удаление родителя должно блокироваться ради истории заказов и выплат.
+Итого 20 FK, у каждого действие `ON DELETE` задано явно:
+
+- **`RESTRICT`** (12 FK) — ссылки на справочники и участников заказа: `address`, `client`, `courier`, `restaurant`, `product`, `product_category`, а также `"order"` → `client_address`. Пока на родителя ссылаются заказы, блюда или выплаты, удалить его нельзя: история заказов и выплат не теряется (BR-3.5), «висячих» ссылок не бывает. Выбран `RESTRICT`, а не `NO ACTION` по умолчанию: нарушение обнаруживается сразу, проверку нельзя отложить до конца транзакции.
+- **`CASCADE`** (8 FK) — подчинённые строки, которые без родителя не имеют смысла: адреса клиента (`client_address` → `client`), позиции заказа (`order_structure` → `"order"`, оба FK), попытки оплаты (`payment` → `"order"`, оба FK), отзывы (`review` → `"order"`, оба FK, и `review` → `client`). Удаление заказа удаляет его состав, оплаты и отзывы. Удаление клиента с заказами всё равно блокирует `order_client_fk` (`RESTRICT`), поэтому каскад по клиенту срабатывает только для клиента без заказов (у него удаляются привязки адресов).
 
 ---
 
@@ -269,7 +273,7 @@ entity_type и entity_id, а проверку «блюдо из этого за�
 |---|---|---|---|
 | `review_entity_check_trg` (BEFORE INSERT/UPDATE) | `review` | BR-9.1, BR-9.2 | Проверяет полиморфную ссылку `entity_id` (ловушка 4) и что отзыв не раньше заказа |
 | `payment_pay_status_trg` (AFTER INSERT/UPDATE/DELETE) | `payment` | BR-8.7 | Пересчитывает `"order".pay_status`: есть успешная попытка → `оплачен`; все попытки с ошибкой → `ошибка`; иначе → `ожидает` |
-| `rating_change_trg` (AFTER INSERT/UPDATE/DELETE) | `review` | BR-9.6, BR-9.7 | FOOD-105: пересчитывает `product.rating` / `restaurant.rating` как `round(avg, 2)`, `NULL` если отзывов нет |
+| `rating_change_trg` (AFTER INSERT/UPDATE/DELETE) | `review` | BR-9.6, BR-9.7 | FOOD-105: пересчитывает `product.rating` / `restaurant.rating` как `round(avg, 2)`, `NULL` если отзывов нет. Пропускается, если в транзакции установлен флаг `kalugin_food.skip_rating = 'on'`: его ставит `insert_test_data` и сама считает рейтинги порции одним `UPDATE` (samples, раздел 10) |
 
 ---
 
@@ -285,11 +289,17 @@ entity_type и entity_id, а проверку «блюдо из этого за�
      courier_pay.amount и coefficient_used — от тройки (год, месяц, курьер);
      в client_address неключевых атрибутов нет.
      Остальные таблицы имеют простой ключ (uuid).
+     Исключение — order_structure.restaurant_id: он зависит от части ключа
+     (определяется и order_id, и product_id по отдельности), то есть формально
+     нарушает 2НФ. Это осознанная контролируемая избыточность, см. «Особые
+     случаи» ниже.
 
 3НФ: нет транзитивных зависимостей неключевых атрибутов от ключа через другие
      неключевые атрибуты. Например, ресторан блюда хранится только в product,
      данные клиента — только в client, а заказ ссылается на них по ключу.
-     Дополнительные таблицы не потребовались: 12 таблиц ERD уже в 3НФ.
+     Дополнительные таблицы не потребовались: 12 таблиц ERD в 3НФ, кроме
+     перечисленных ниже осознанных отступлений, каждое из которых защищено
+     от аномалий схемой.
 
 Особые случаи:
 - order.commission = 10% от order_amount и order.total_amount = order_amount +
@@ -304,9 +314,16 @@ entity_type и entity_id, а проверку «блюдо из этого за�
   триггер rating_change при любом INSERT/UPDATE/DELETE отзыва (BR-9.7).
 - order.pay_status — агрегат по payment (BR-8.7). Аналогично поддерживается
   триггером payment_pay_status.
-- order_structure.restaurant_id — дублирует ресторан, но жёстко сверен двумя
-  составными FK с заказом и блюдом (ловушка 3), поэтому не может разойтись
-  с источниками.
+- order_structure.restaurant_id — контролируемая избыточность (отступление
+  от 2НФ): ресторан уже известен и по order_id ("order".restaurant_id), и по
+  product_id (product.restaurant_id). Столбец нужен ради BR-7.3 «все блюда
+  заказа — из ресторана заказа»: только с ним можно построить два составных FK
+    (order_id,   restaurant_id) -> "order"(order_id,   restaurant_id)
+    (product_id, restaurant_id) -> product(product_id, restaurant_id),
+  которые проверяют правило декларативно, без триггера (ловушка 3).
+  Аномалий обновления нет: значение сверено FK с обоими источниками и не
+  может с ними разойтись — изменить ресторан у заказа или блюда, на которые
+  ссылается состав, FK не даст.
 - review.entity_id + entity_type — полиморфная ссылка. Не нарушает 3НФ:
   пара (тип, id) атомарно описывает объект отзыва и зависит только от
   review_id. Отсутствие FK компенсировано триггером (ловушка 4).

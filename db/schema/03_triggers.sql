@@ -115,6 +115,10 @@ create trigger payment_pay_status_trg
 -- При UPDATE пересчитываются и старая, и новая сущность (если ссылка
 -- изменилась). Нет отзывов -> AVG даёт NULL. Триггер меняет только product
 -- и restaurant, поэтому рекурсии по review нет.
+-- Генератор insert_test_data не пересчитывает рейтинг на каждый отзыв:
+-- на время генерации он ставит флаг транзакции kalugin_food.skip_rating = 'on'
+-- и в конце считает рейтинги порции сам. Без ALTER TABLE ... DISABLE TRIGGER,
+-- для которого нужно владение таблицей.
 -- ---------------------------------------------------------------------------
 create or replace function rating_change()
 returns trigger
@@ -126,6 +130,11 @@ declare
     v_ids   uuid[] := '{}';
     k       integer;
 begin
+    -- missing_ok = true: если флаг ни разу не ставили, вернётся NULL
+    if current_setting('kalugin_food.skip_rating', true) = 'on' then
+        return null;
+    end if;
+
     if tg_op in ('UPDATE', 'DELETE') then
         v_types := v_types || old.entity_type;
         v_ids   := v_ids   || old.entity_id;

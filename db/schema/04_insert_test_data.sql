@@ -11,7 +11,13 @@
 -- новую порцию данных и связывает между собой только строки этой порции,
 -- поэтому выплаты курьеров прошлых вызовов не теряют согласованность.
 --
--- Процедура не вызывает другие функции и процедуры схемы (только INSERT/UPDATE).
+-- Процедура не вызывает другие функции и процедуры схемы: courier_pay,
+-- блюда и рейтинги заполняются прямыми INSERT/UPDATE. При этом на вставляемых
+-- строках срабатывают триггеры таблиц: review_entity_check (проверка отзыва)
+-- и payment_pay_status (order.pay_status по BR-8.7). Триггер rating_change
+-- на время генерации пропускается: процедура ставит флаг транзакции
+-- kalugin_food.skip_rating, а рейтинги этой порции считает одним UPDATE
+-- в разделе 9 (samples, раздел 10).
 
 set search_path to kalugin_food;
 
@@ -53,27 +59,40 @@ declare
     v_client      uuid[] := '{}';
     v_prod        uuid[] := '{}';
     v_prod_price  numeric[] := '{}';
+    v_extra_addr  uuid[];          -- дополнительный (соседский) адрес клиента или NULL
 
     v_id          uuid;
+    v_price       numeric;
     v_text        text;
     v_hire        date;
     v_dismiss     date;
     v_status_c    courier_status;
     v_active_st   courier_status[] := array_remove(enum_range(null::courier_status), 'уволен');
+    v_rest_st     restaurant_status[] := enum_range(null::restaurant_status);
+    v_order_all   order_status[] := enum_range(null::order_status);
+    -- незавершённые: создан .. в_доставке; завершённые: доставлен .. отменён (порядок enum)
+    v_order_open  order_status[] := enum_range(null::order_status, 'в_доставке'::order_status);
+    v_order_done  order_status[] := enum_range('доставлен'::order_status, null::order_status);
     v_start_time  time;
     v_base        bigint;
-    v_window_start date := (date_trunc('month', current_date) - interval '5 months')::date;
+    -- месяцы выплат: текущий и пять предыдущих (BR-10.7)
+    v_pay_start   date := (date_trunc('month', current_date) - interval '5 months')::date;
+    -- даты данных: последние 180 дней, но не раньше первого месяца выплат,
+    -- чтобы у каждого доставленного заказа был месяц в courier_pay
+    v_window_start date := greatest(v_pay_start, current_date - 180);
 
     -- заказ
     v_ci          integer;
     v_ri          integer;
     v_ki          integer;
+    v_ai          integer;
     v_order_id    uuid;
     v_order_addr  uuid;
     v_order_ts    timestamp;
     v_deliv_ts    timestamp;
     v_order_st    order_status;
     v_items       integer[];
+    v_swap        integer;
     v_qty         numeric[];
     v_amount      numeric;
     v_n_items     integer;
@@ -92,6 +111,11 @@ begin
     if value is null or value < 1 then
         raise exception 'insert_test_data: value должно быть положительным, передано %', value;
     end if;
+
+    -- rating_change не пересчитывает рейтинг на каждый отзыв генератора:
+    -- флаг действует до конца транзакции (is_local = true) и снимается
+    -- перед итоговым пересчётом в разделе 9.
+    perform set_config('kalugin_food.skip_rating', 'on', true);
 
     -- -----------------------------------------------------------------------
     -- 1. Категории блюд (value). Название уникально (BR-5.7).
@@ -112,10 +136,10 @@ begin
     end loop;
 
     -- -----------------------------------------------------------------------
-    -- 2. Курьеры (value). Все даты — внутри окна из 6 месяцев: с 1-го числа
-    --    месяца пять месяцев назад по сегодня. Это то же окно, за которое
-    --    генерируются выплаты, поэтому каждый доставленный заказ попадает
-    --    в месяц, по которому есть запись courier_pay.
+    -- 2. Курьеры (value). Все даты — внутри окна v_window_start .. сегодня:
+    --    не старше 180 дней и не раньше 1-го числа месяца пять месяцев назад.
+    --    Выплаты генерируются за все месяцы этого окна, поэтому каждый
+    --    доставленный заказ попадает в месяц, по которому есть запись courier_pay.
     --    Первый курьер всегда работает и нанят в начале окна (BR-6.6).
     --    Около 20% остальных — уволены, с датой увольнения не раньше даты
     --    найма (BR-6.3).
@@ -195,7 +219,9 @@ begin
                     || ', ОГРН ' || lpad(floor(random() * 1e13)::bigint::text, 13, '0')
                     || ', р/с 40702810' || lpad(floor(random() * 1e12)::bigint::text, 12, '0'),
                 null,
-                case when random() < 0.9 then 'активен' else 'неактивен' end::restaurant_status)
+                case when random() < 0.9 then 'активен'::restaurant_status
+                     else v_rest_st[1 + floor(random() * cardinality(v_rest_st))::int]
+                end)
         returning restaurant_id into v_id;
         v_rest := v_rest || v_id;
     end loop;
@@ -223,18 +249,22 @@ begin
     -- 6. Адреса клиентов (BR-2.4, BR-2.5): клиентские адреса раздаются по
     --    кругу (у каждого клиента 4 адреса), часть клиентов дополнительно
     --    пользуется адресом соседа. Дубли пары исключает PK.
+    --    Адреса клиента i: v_addr[value + i + value * k], k = 0..3,
+    --    и v_extra_addr[i], если он есть, — из них выбирается адрес заказа.
     -- -----------------------------------------------------------------------
     for i in 1..value * 4 loop
         insert into client_address (client_id, address_id)
         values (v_client[1 + (i - 1) % value], v_addr[value + i]);
     end loop;
 
+    v_extra_addr := array_fill(null::uuid, array[value]);
     if value > 1 then
         for i in 1..value loop
             if random() < 0.2 then
+                -- адрес соседа (клиента i % value + 1) у клиента i ещё не привязан
                 insert into client_address (client_id, address_id)
-                values (v_client[i], v_addr[value + 1 + (i % value)])
-                on conflict do nothing;
+                values (v_client[i], v_addr[value + 1 + (i % value)]);
+                v_extra_addr[i] := v_addr[value + 1 + (i % value)];
             end if;
         end loop;
     end if;
@@ -259,9 +289,9 @@ begin
                           [1 + floor(random() * cardinality(enum_range(null::product_status)))::int]
                 end,
                 'Фирменное блюдо, вес ' || (200 + floor(random() * 300))::int || ' г')
-        returning product_id into v_id;
+        returning product_id, price into v_id, v_price;
         v_prod := v_prod || v_id;
-        v_prod_price := v_prod_price || (select price from product where product_id = v_id);
+        v_prod_price := v_prod_price || v_price;
     end loop;
 
     -- -----------------------------------------------------------------------
@@ -272,27 +302,29 @@ begin
         v_ri := 1 + floor(random() * value)::int;
         v_ki := 1 + floor(random() * value)::int;
 
-        -- адрес доставки — один из адресов клиента (BR-7.4)
-        select ca.address_id
-          into v_order_addr
-          from client_address ca
-         where ca.client_id = v_client[v_ci]
-         order by random()
-         limit 1;
+        -- адрес доставки — один из адресов клиента (BR-7.4), по случайному
+        -- индексу из массива адресов, без запроса к client_address
+        v_ai := floor(random() * (4 + (v_extra_addr[v_ci] is not null)::int))::int;
+        v_order_addr := case
+                            when v_ai = 4 then v_extra_addr[v_ci]
+                            else v_addr[value + v_ci + value * v_ai]
+                        end;
 
         -- статус: у уволенного курьера заказы только завершённые
         if v_cour_fired[v_ki] then
-            v_order_st := case when random() < 0.85 then 'доставлен' else 'отменён' end;
+            v_order_st := case
+                              when random() < 0.85 then 'доставлен'::order_status
+                              else v_order_done[1 + floor(random() * cardinality(v_order_done))::int]
+                          end;
         elsif random() < 0.7 then
             v_order_st := 'доставлен';
         else
-            v_order_st := (enum_range(null::order_status))
-                          [1 + floor(random() * cardinality(enum_range(null::order_status)))::int];
+            v_order_st := v_order_all[1 + floor(random() * cardinality(v_order_all))::int];
         end if;
 
         -- время заказа — в период работы курьера (не раньше найма и не позже увольнения),
         -- незавершённые заказы — за последние 2 часа
-        if v_order_st in ('создан', 'готовится', 'в_доставке') then
+        if v_order_st = any (v_order_open) then
             v_order_ts := greatest(v_cour_start[v_ki],
                                    localtimestamp - random() * interval '2 hours');
         else
@@ -309,11 +341,17 @@ begin
             v_deliv_ts := null;
         end if;
 
-        -- состав: 1..3 разных блюда ресторана заказа (BR-7.3, BR-7.16)
+        -- состав: 1..3 разных блюда ресторана заказа (BR-7.3, BR-7.16).
+        -- Индексы 5 блюд ресторана перемешиваются в массиве (Фишер — Йетс),
+        -- берутся первые v_n_items — без повторов и без запросов к таблицам.
         v_n_items := 1 + floor(random() * 3)::int;
-        select array_agg(v_ri + value * k order by random())
-          into v_items
-          from generate_series(0, 4) as k;
+        v_items := array[v_ri, v_ri + value, v_ri + value * 2, v_ri + value * 3, v_ri + value * 4];
+        for j in reverse 5..2 loop
+            v_ai := 1 + floor(random() * j)::int;
+            v_swap := v_items[j];
+            v_items[j] := v_items[v_ai];
+            v_items[v_ai] := v_swap;
+        end loop;
         v_items := v_items[1:v_n_items];
 
         v_qty := '{}';
@@ -343,9 +381,11 @@ begin
             values (v_order_id, v_prod[v_items[j]], v_rest[v_ri], v_qty[j]);
         end loop;
 
-        -- оплата: одна попытка на заказ, сумма = total_amount (BR-8.4).
-        -- Новый заказ ещё в обработке, остальные оплачены успешно (BR-8.1).
-        -- order.pay_status пересчитывает триггер payment_pay_status (BR-8.7).
+        -- оплата: одна попытка на заказ, и она успешная — у каждого заказа
+        -- ровно одна успешная оплата (BR-8.1), а строк payment ровно
+        -- value * 5 (BR-11.7). Сумма = total_amount (BR-8.4).
+        -- Предоплата: заказ в любом статусе (и 'создан') уже оплачен.
+        -- order.pay_status = 'оплачен' выставляет триггер payment_pay_status (BR-8.7).
         insert into payment (payment_id, order_id, payment_type, amount, transaction_ref,
                              transaction_timestamp, status)
         select exts.uuid_generate_v4(), o.order_id,
@@ -355,7 +395,7 @@ begin
                'TX-' || replace(exts.uuid_generate_v4()::text, '-', ''),
                least(o.order_timestamp + (1 + floor(random() * 10))::int * interval '1 minute',
                      date_trunc('second', localtimestamp)),
-               case when v_order_st = 'создан' then 'в_обработке' else 'успех' end::payment_status
+               'успех'::payment_status
           from "order" o
          where o.order_id = v_order_id;
 
@@ -383,8 +423,13 @@ begin
 
     -- -----------------------------------------------------------------------
     -- 9. Рейтинги блюд и ресторанов этой порции = среднее по отзывам,
-    --    NULL если отзывов нет (BR-9.6, BR-9.7).
+    --    NULL если отзывов нет (BR-9.6, BR-9.7). Считаются здесь одним
+    --    UPDATE, а не триггером rating_change на каждый отзыв. Флаг пропуска
+    --    снимается, чтобы дальнейшие изменения отзывов в этой же транзакции
+    --    снова пересчитывали рейтинг.
     -- -----------------------------------------------------------------------
+    perform set_config('kalugin_food.skip_rating', 'off', true);
+
     update product p
        set rating = (select round(avg(r.rating), 2)
                        from review r
@@ -416,7 +461,7 @@ begin
             select m.mon,
                    count(o.order_id)              as cnt,
                    coalesce(sum(o.commission), 0) as commission_sum
-              from generate_series(v_window_start::timestamp,
+              from generate_series(v_pay_start::timestamp,
                                    date_trunc('month', current_date),
                                    interval '1 month') as m(mon)
               left join "order" o
