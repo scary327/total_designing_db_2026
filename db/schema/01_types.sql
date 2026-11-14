@@ -1,27 +1,27 @@
 -- FOOD-101. Перечислимые типы (BR-11.5: только enum, не varchar).
 
-set search_path to kalugin_food;
+SET search_path TO kalugin_food;
 
 -- BR-4.3
-create type restaurant_status as enum ('активен', 'неактивен');
+CREATE TYPE restaurant_status AS ENUM ('активен', 'неактивен');
 
 -- BR-5.5
-create type product_status as enum ('доступно', 'нет_в_наличии', 'архив');
+CREATE TYPE product_status AS ENUM ('доступно', 'нет_в_наличии', 'архив');
 
 -- BR-6.2
-create type courier_status as enum ('свободен', 'занят', 'на_доставке', 'уволен');
+CREATE TYPE courier_status AS ENUM ('свободен', 'занят', 'на_доставке', 'уволен');
 
 -- BR-7.7
-create type order_status as enum ('создан', 'готовится', 'в_доставке', 'доставлен', 'отменён');
+CREATE TYPE order_status AS ENUM ('создан', 'готовится', 'в_доставке', 'доставлен', 'отменён');
 
 -- BR-7.9
-create type order_pay_status as enum ('ожидает', 'оплачен', 'ошибка');
+CREATE TYPE order_pay_status AS ENUM ('ожидает', 'оплачен', 'ошибка');
 
 -- BR-8.2
-create type payment_status as enum ('успех', 'ошибка', 'в_обработке');
+CREATE TYPE payment_status AS ENUM ('успех', 'ошибка', 'в_обработке');
 
 -- BR-8.2
-create type payment_type as enum ('карта', 'наличные', 'безнал');
+CREATE TYPE payment_type AS ENUM ('карта', 'наличные', 'безнал');
 
 -- BR-9.1
-create type review_entity_type as enum ('блюдо', 'ресторан', 'заказ');
+CREATE TYPE review_entity_type AS ENUM ('блюдо', 'ресторан', 'заказ');

@@ -1,6 +1,6 @@
 -- Триггеры целостности и агрегатов.
 
-set search_path to kalugin_food;
+SET search_path TO kalugin_food;
 
 -- ---------------------------------------------------------------------------
 -- FOOD-101. Проверка полиморфной ссылки review.entity_id (BR-9.1, BR-9.2).
@@ -11,59 +11,59 @@ set search_path to kalugin_food;
 --   'заказ'    -> entity_id совпадает с order_id.
 -- Принадлежность заказа клиенту обеспечивает FK review_order_client_fk.
 -- ---------------------------------------------------------------------------
-create or replace function review_entity_check()
-returns trigger
-language plpgsql
-set search_path = kalugin_food, exts
-as $$
-declare
+CREATE OR REPLACE FUNCTION review_entity_check()
+RETURNS TRIGGER
+LANGUAGE PLPGSQL
+SET search_path = kalugin_food, exts
+AS $$
+DECLARE
     v_order_ts timestamp;
-begin
-    select o.order_timestamp
-      into v_order_ts
-      from "order" o
-     where o.order_id = new.order_id;
+BEGIN
+    SELECT o.order_timestamp
+      INTO v_order_ts
+      FROM "order" o
+     WHERE o.order_id = new.order_id;
 
-    if not found then
-        raise exception 'Отзыв: заказ % не существует', new.order_id;
-    end if;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Отзыв: заказ % не существует', new.order_id;
+    END IF;
 
-    if new.review_timestamp < v_order_ts then
-        raise exception 'Отзыв: дата отзыва (%) раньше даты заказа (%)',
+    IF new.review_timestamp < v_order_ts THEN
+        RAISE EXCEPTION 'Отзыв: дата отзыва (%) раньше даты заказа (%)',
             new.review_timestamp, v_order_ts;
-    end if;
+    END IF;
 
-    if new.entity_type = 'блюдо' then
-        if not exists (select 1
-                         from order_structure os
-                        where os.order_id = new.order_id
-                          and os.product_id = new.entity_id) then
-            raise exception 'Отзыв: блюдо % отсутствует в заказе %',
+    IF new.entity_type = 'блюдо' THEN
+        IF NOT EXISTS (SELECT 1
+                         FROM order_structure os
+                        WHERE os.order_id = new.order_id
+                          AND os.product_id = new.entity_id) THEN
+            RAISE EXCEPTION 'Отзыв: блюдо % отсутствует в заказе %',
                 new.entity_id, new.order_id;
-        end if;
-    elsif new.entity_type = 'ресторан' then
-        if not exists (select 1
-                         from "order" o
-                        where o.order_id = new.order_id
-                          and o.restaurant_id = new.entity_id) then
-            raise exception 'Отзыв: ресторан % не является рестораном заказа %',
+        END IF;
+    ELSIF new.entity_type = 'ресторан' THEN
+        IF NOT EXISTS (SELECT 1
+                         FROM "order" o
+                        WHERE o.order_id = new.order_id
+                          AND o.restaurant_id = new.entity_id) THEN
+            RAISE EXCEPTION 'Отзыв: ресторан % не является рестораном заказа %',
                 new.entity_id, new.order_id;
-        end if;
-    elsif new.entity_type = 'заказ' then
-        if new.entity_id <> new.order_id then
-            raise exception 'Отзыв на заказ: entity_id (%) должен совпадать с order_id (%)',
+        END IF;
+    ELSIF new.entity_type = 'заказ' THEN
+        IF new.entity_id <> new.order_id THEN
+            RAISE EXCEPTION 'Отзыв на заказ: entity_id (%) должен совпадать с order_id (%)',
                 new.entity_id, new.order_id;
-        end if;
-    end if;
+        END IF;
+    END IF;
 
-    return new;
-end;
+    RETURN NEW;
+END;
 $$;
 
-create trigger review_entity_check_trg
-    before insert or update on review
-    for each row
-    execute function review_entity_check();
+CREATE TRIGGER review_entity_check_trg
+    BEFORE INSERT OR UPDATE ON review
+    FOR EACH ROW
+    EXECUTE FUNCTION review_entity_check();
 
 -- ---------------------------------------------------------------------------
 -- FOOD-101. Агрегированный статус оплаты заказа (BR-8.7):
@@ -71,46 +71,46 @@ create trigger review_entity_check_trg
 --   'ошибка'  — попытки есть и все завершились ошибкой;
 --   'ожидает' — иначе (есть попытки в обработке или попыток нет).
 -- ---------------------------------------------------------------------------
-create or replace function payment_pay_status()
-returns trigger
-language plpgsql
-set search_path = kalugin_food, exts
-as $$
-declare
-    v_order_id uuid;
+CREATE OR REPLACE FUNCTION payment_pay_status()
+RETURNS TRIGGER
+LANGUAGE PLPGSQL
+SET search_path = kalugin_food, exts
+AS $$
+DECLARE
+    v_order_id UUID;
     v_status   order_pay_status;
-begin
-    foreach v_order_id in array
-        case tg_op
-            when 'INSERT' then array[new.order_id]
-            when 'DELETE' then array[old.order_id]
-            else array[old.order_id, new.order_id]
-        end
-    loop
-        select case
-                   when bool_or(p.status = 'успех') then 'оплачен'
-                   when count(*) > 0 and bool_and(p.status = 'ошибка') then 'ошибка'
-                   else 'ожидает'
-               end::order_pay_status
-          into v_status
-          from payment p
-         where p.order_id = v_order_id;
+BEGIN
+    FOREACH v_order_id IN array
+        CASE tg_op
+            WHEN 'INSERT' THEN array[new.order_id]
+            WHEN 'DELETE' THEN array[old.order_id]
+            ELSE array[old.order_id, new.order_id]
+        END
+    LOOP
+        SELECT CASE
+                   WHEN bool_or(p.status = 'успех') THEN 'оплачен'
+                   WHEN count(*) > 0 AND bool_and(p.status = 'ошибка') THEN 'ошибка'
+                   ELSE 'ожидает'
+               END::order_pay_status
+          INTO v_status
+          FROM payment p
+         WHERE p.order_id = v_order_id;
 
         -- строка заказа переписывается, только если статус действительно изменился
-        update "order" o
-           set pay_status = v_status
-         where o.order_id = v_order_id
-           and o.pay_status is distinct from v_status;
-    end loop;
+        UPDATE "order" o
+           SET pay_status = v_status
+         WHERE o.order_id = v_order_id
+           AND o.pay_status IS DISTINCT FROM v_status;
+    END LOOP;
 
-    return null;
-end;
+    RETURN NULL;
+END;
 $$;
 
-create trigger payment_pay_status_trg
-    after insert or update or delete on payment
-    for each row
-    execute function payment_pay_status();
+CREATE TRIGGER payment_pay_status_trg
+    AFTER INSERT OR UPDATE OR DELETE ON payment
+    FOR EACH ROW
+    EXECUTE FUNCTION payment_pay_status();
 
 -- ---------------------------------------------------------------------------
 -- FOOD-105. Пересчёт агрегированного рейтинга (BR-9.6, BR-9.7).
@@ -125,56 +125,59 @@ create trigger payment_pay_status_trg
 -- и в конце считает рейтинги порции сам. Без ALTER TABLE ... DISABLE TRIGGER,
 -- для которого нужно владение таблицей.
 -- ---------------------------------------------------------------------------
-create or replace function rating_change()
-returns trigger
-language plpgsql
-set search_path = kalugin_food, exts
-as $$
-declare
+CREATE OR REPLACE FUNCTION rating_change()
+RETURNS TRIGGER
+LANGUAGE PLPGSQL
+SET search_path = kalugin_food, exts
+AS $$
+DECLARE
     v_types review_entity_type[] := '{}';
-    v_ids   uuid[] := '{}';
+    v_ids   UUID[] := '{}';
     k       integer;
-begin
+BEGIN
     -- missing_ok = true: если флаг ни разу не ставили, вернётся NULL
-    if current_setting('kalugin_food.skip_rating', true) = 'on' then
-        return null;
-    end if;
+    IF current_setting('kalugin_food.skip_rating', TRUE) = 'on' THEN
+        RETURN NULL;
+    END IF;
 
-    if tg_op in ('UPDATE', 'DELETE') then
+    -- OLD нужно пересчитать при DELETE и UPDATE (в том числе при изменении
+    -- только rating); NEW — при INSERT или переносе отзыва к другому объекту.
+    -- При неизменной ссылке один пересчёт уже учитывает новое значение rating.
+    IF tg_op IN ('UPDATE', 'DELETE') THEN
         v_types := v_types || old.entity_type;
         v_ids   := v_ids   || old.entity_id;
-    end if;
+    END IF;
 
-    if tg_op = 'INSERT'
-       or (tg_op = 'UPDATE'
-           and (new.entity_type, new.entity_id) is distinct from (old.entity_type, old.entity_id)) then
+    IF tg_op = 'INSERT'
+       OR (tg_op = 'UPDATE'
+           AND (new.entity_type, new.entity_id) IS DISTINCT FROM (old.entity_type, old.entity_id)) THEN
         v_types := v_types || new.entity_type;
         v_ids   := v_ids   || new.entity_id;
-    end if;
+    END IF;
 
-    for k in 1 .. coalesce(array_length(v_ids, 1), 0) loop
-        if v_types[k] = 'блюдо' then
-            update product p
-               set rating = (select round(avg(r.rating), 2)
-                               from review r
-                              where r.entity_type = 'блюдо'
-                                and r.entity_id = v_ids[k])
-             where p.product_id = v_ids[k];
-        elsif v_types[k] = 'ресторан' then
-            update restaurant rs
-               set rating = (select round(avg(r.rating), 2)
-                               from review r
-                              where r.entity_type = 'ресторан'
-                                and r.entity_id = v_ids[k])
-             where rs.restaurant_id = v_ids[k];
-        end if;
-    end loop;
+    FOR k IN 1 .. coalesce(array_length(v_ids, 1), 0) LOOP
+        IF v_types[k] = 'блюдо' THEN
+            UPDATE product p
+               SET rating = (SELECT round(avg(r.rating), 2)
+                               FROM review r
+                              WHERE r.entity_type = 'блюдо'
+                                AND r.entity_id = v_ids[k])
+             WHERE p.product_id = v_ids[k];
+        ELSIF v_types[k] = 'ресторан' THEN
+            UPDATE restaurant rs
+               SET rating = (SELECT round(avg(r.rating), 2)
+                               FROM review r
+                              WHERE r.entity_type = 'ресторан'
+                                AND r.entity_id = v_ids[k])
+             WHERE rs.restaurant_id = v_ids[k];
+        END IF;
+    END LOOP;
 
-    return null;
-end;
+    RETURN NULL;
+END;
 $$;
 
-create trigger rating_change_trg
-    after insert or update or delete on review
-    for each row
-    execute function rating_change();
+CREATE TRIGGER rating_change_trg
+    AFTER INSERT OR UPDATE OR DELETE ON review
+    FOR EACH ROW
+    EXECUTE FUNCTION rating_change();

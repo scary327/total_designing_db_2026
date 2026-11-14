@@ -2,4 +2,4 @@
 -- Схема exts с расширением uuid-ossp уже существует на сервере (BR-13.3),
 -- здесь она не создаётся и не пересоздаётся.
 
-create schema if not exists kalugin_food;
+CREATE SCHEMA IF NOT EXISTS kalugin_food;
