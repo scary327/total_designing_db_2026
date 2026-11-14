@@ -3,14 +3,13 @@
 -- удаления по FK. Типы, функции, процедуры, триггеры и представления не
 -- затрагиваются. Повторный вызов на пустых таблицах не падает.
 
-SET search_path TO kalugin_food;
+set search_path to kalugin_food;
 
-CREATE OR REPLACE PROCEDURE erase_test_data()
-LANGUAGE PLPGSQL
-SET search_path = kalugin_food, exts
-AS $$
-BEGIN
-    TRUNCATE TABLE review,
+create or replace procedure erase_test_data()
+set search_path = kalugin_food, exts
+as $$
+begin
+    truncate table review,
                    payment,
                    order_structure,
                    "order",
@@ -22,5 +21,5 @@ BEGIN
                    client,
                    courier,
                    address;
-END;
-$$;
+end;
+$$ language plpgsql;

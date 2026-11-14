@@ -3,26 +3,25 @@
 -- генерирует product_id; ограничения таблицы проверяют входные данные.
 -- Ошибки FK, CHECK и NOT NULL выдаёт PostgreSQL с именем ограничения.
 
-SET search_path TO kalugin_food;
+set search_path to kalugin_food;
 
-CREATE OR REPLACE PROCEDURE add_product(
-    p_restaurant_id       UUID,
-    p_product_category_id UUID,
+create or replace procedure add_product(
+    p_restaurant_id       uuid,
+    p_product_category_id uuid,
     p_name                varchar,
     p_price               numeric,
     p_description         text,
-    p_status              text    DEFAULT 'доступно',
-    p_rating              numeric DEFAULT NULL,
-    p_photo_url           text    DEFAULT NULL
+    p_status              text    default 'доступно',
+    p_rating              numeric default null,
+    p_photo_url           text    default null
 )
-LANGUAGE PLPGSQL
-SET search_path = kalugin_food, exts
-AS $$
-BEGIN
-    INSERT INTO product (product_name, product_category_id, price,
+set search_path = kalugin_food, exts
+as $$
+begin
+    insert into product (product_name, product_category_id, price,
                          restaurant_id, photo_url, rating, status, description)
-    VALUES (p_name, p_product_category_id, p_price,
+    values (p_name, p_product_category_id, p_price,
             p_restaurant_id, p_photo_url, p_rating, p_status::product_status,
             p_description);
-END;
-$$;
+end;
+$$ language plpgsql;

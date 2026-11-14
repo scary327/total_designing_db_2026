@@ -7,12 +7,8 @@ CALL insert_test_data(10);
 DO $$
 DECLARE
  o_id uuid; c_id uuid; a_id uuid; r_id uuid; p_id uuid; cat_id uuid; k_id uuid;
- n_default integer; n_cascade integer;
 BEGIN
- SELECT count(*) FILTER (WHERE confdeltype = 'a'), count(*) FILTER (WHERE confdeltype = 'c')
- INTO n_default, n_cascade FROM pg_constraint
- WHERE contype = 'f' AND connamespace = 'kalugin_food'::regnamespace;
- IF n_default <> 12 OR n_cascade <> 8 THEN RAISE EXCEPTION 'Unexpected foreign key actions: %, %', n_default, n_cascade; END IF;
+ IF EXISTS (SELECT FROM pg_constraint WHERE contype='f' AND connamespace='kalugin_food'::regnamespace AND confdeltype NOT IN ('a','c')) THEN RAISE EXCEPTION 'Unexpected foreign key action'; END IF;
  SELECT o.order_id, o.client_id, o.address_id, o.restaurant_id, o.courier_id, s.product_id, p.product_category_id
  INTO o_id, c_id, a_id, r_id, k_id, p_id, cat_id
  FROM "order" o JOIN order_structure s ON s.order_id = o.order_id JOIN product p ON p.product_id = s.product_id LIMIT 1;

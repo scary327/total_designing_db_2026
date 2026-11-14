@@ -13,56 +13,56 @@
 -- содержит коэффициент следующего месяца, и повторный вызов не должен
 -- пересчитать зарплату по нему.
 
-SET search_path TO kalugin_food;
+set search_path to kalugin_food;
 
-CREATE OR REPLACE PROCEDURE courier_salary()
-LANGUAGE PLPGSQL
-SET search_path = kalugin_food, exts
-AS $$
-DECLARE
-    v_month_start timestamp := date_trunc('month', LOCALTIMESTAMP);
-    v_year        integer   := extract(YEAR FROM v_month_start)::int;
-    v_month       integer   := extract(MONTH FROM v_month_start)::int;
-BEGIN
-    WITH stats AS (
-        SELECT c.courier_id,
+create or replace procedure courier_salary()
+set search_path = kalugin_food, exts
+as $$
+declare
+    v_month_start timestamp = date_trunc('month', localtimestamp);
+    v_year        integer   = extract(year from v_month_start)::int;
+    v_month       integer   = extract(month from v_month_start)::int;
+begin
+    with stats as (
+        select c.courier_id,
                c.status,
-               coalesce(cp.coefficient_used, c.coefficient) AS coef_used,
-               count(o.order_id)                            AS delivered_cnt,
-               coalesce(sum(o.commission), 0)               AS commission_sum
-          FROM courier c
-          LEFT JOIN courier_pay cp
-                 ON cp.courier_id = c.courier_id
-                AND cp.year = v_year
-                AND cp.month = v_month
-          LEFT JOIN "order" o
-                 ON o.courier_id = c.courier_id
-                AND o.status = 'доставлен'
-                AND o.order_timestamp >= v_month_start
-                AND o.order_timestamp <  v_month_start + interval '1 month'
-         WHERE c.dismissal_date IS NULL
-            OR c.dismissal_date >= v_month_start::date
-         GROUP BY c.courier_id, c.status, cp.coefficient_used, c.coefficient
+               coalesce(cp.coefficient_used, c.coefficient) as coef_used,
+               count(o.order_id)                            as delivered_cnt,
+               coalesce(sum(o.commission), 0)               as commission_sum
+          from courier c
+          left join courier_pay cp
+                 on cp.courier_id = c.courier_id
+                and cp.year = v_year
+                and cp.month = v_month
+          left join "order" o
+                 on o.courier_id = c.courier_id
+                and o.status = 'доставлен'
+                and o.order_timestamp >= v_month_start
+                and o.order_timestamp <  v_month_start + interval '1 month'
+         where c.hire_date < (v_month_start + interval '1 month')::date
+           and (c.dismissal_date is null
+                or c.dismissal_date >= v_month_start::date)
+         group by c.courier_id, c.status, cp.coefficient_used, c.coefficient
     ),
-    pay AS (
-        INSERT INTO courier_pay AS cp (YEAR, MONTH, courier_id, amount, coefficient_used)
-        SELECT v_year, v_month, s.courier_id,
+    pay as (
+        insert into courier_pay as cp (year, month, courier_id, amount, coefficient_used)
+        select v_year, v_month, s.courier_id,
                round(s.coef_used * s.commission_sum, 2),
                s.coef_used
-          FROM stats s
-        ON CONFLICT (YEAR, MONTH, courier_id) DO UPDATE
-           SET amount           = excluded.amount,
+          from stats s
+        on conflict (year, month, courier_id) do update
+           set amount           = excluded.amount,
                coefficient_used = excluded.coefficient_used
     )
-    UPDATE courier c
-       SET coefficient = CASE
-                             WHEN s.delivered_cnt > 500 THEN 0.5
-                             WHEN s.delivered_cnt > 250 THEN 0.3
-                             WHEN s.delivered_cnt > 150 THEN 0.2
-                             ELSE 0.1
-                         END
-      FROM stats s
-     WHERE s.courier_id = c.courier_id
-       AND s.status <> 'уволен';
-END;
-$$;
+    update courier c
+       set coefficient = case
+                             when s.delivered_cnt > 500 then 0.5
+                             when s.delivered_cnt > 250 then 0.3
+                             when s.delivered_cnt > 150 then 0.2
+                             else 0.1
+                         end
+      from stats s
+     where s.courier_id = c.courier_id
+       and s.status <> 'уволен';
+end;
+$$ language plpgsql;

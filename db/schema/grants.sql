@@ -4,53 +4,53 @@
 -- Скрипт идемпотентен: повторный запуск не падает.
 
 -- 1. Создаём роль только при её отсутствии; существующий пароль не меняем.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'inspector') THEN
-        CREATE ROLE inspector login password 'NetoSQL2025';
-    END IF;
-END;
+do $$
+begin
+    if not exists (select 1 from pg_roles where rolname = 'inspector') then
+        create role inspector login password 'NetoSQL2025';
+    end if;
+end;
 $$;
 
 -- 2. Подключение к текущей базе и временные объекты
-DO $$
-BEGIN
-    EXECUTE format('grant connect, temporary on database %I to inspector', current_database());
-END;
+do $$
+begin
+    execute format('grant connect, temporary on database %I to inspector', current_database());
+end;
 $$;
 
 -- 3. Системные схемы (по умолчанию есть у PUBLIC, выдаём явно на случай отзыва)
-GRANT USAGE ON SCHEMA information_schema TO inspector;
-GRANT USAGE ON SCHEMA pg_catalog TO inspector;
+grant usage on schema information_schema to inspector;
+grant usage on schema pg_catalog to inspector;
 
 -- 4. Схема exts — для exts.uuid_generate_v4()
-GRANT USAGE ON SCHEMA exts TO inspector;
-GRANT EXECUTE ON ALL functions IN SCHEMA exts TO inspector;
+grant usage on schema exts to inspector;
+grant execute on all functions in schema exts to inspector;
 
 -- 5. Полный доступ к схеме проекта и всем её объектам
-GRANT ALL PRIVILEGES ON SCHEMA kalugin_food TO inspector;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA kalugin_food TO inspector;
-GRANT ALL PRIVILEGES ON ALL sequences IN SCHEMA kalugin_food TO inspector;
-GRANT ALL PRIVILEGES ON ALL routines IN SCHEMA kalugin_food TO inspector;
+grant all privileges on schema kalugin_food to inspector;
+grant all privileges on all tables in schema kalugin_food to inspector;
+grant all privileges on all sequences in schema kalugin_food to inspector;
+grant all privileges on all routines in schema kalugin_food to inspector;
 
 -- enum-типы (USAGE по умолчанию есть у PUBLIC, выдаём явно)
-DO $$
-DECLARE
+do $$
+declare
     r record;
-BEGIN
-    FOR r IN
-        SELECT t.typname
-          FROM pg_type t
-          JOIN pg_namespace n ON n.oid = t.typnamespace
-         WHERE n.nspname = 'kalugin_food'
-           AND t.typtype = 'e'
-    LOOP
-        EXECUTE format('grant usage on type kalugin_food.%I to inspector', r.typname);
-    END LOOP;
-END;
+begin
+    for r in
+        select t.typname
+          from pg_type t
+          join pg_namespace n on n.oid = t.typnamespace
+         where n.nspname = 'kalugin_food'
+           and t.typtype = 'e'
+    loop
+        execute format('grant usage on type kalugin_food.%I to inspector', r.typname);
+    end loop;
+end;
 $$;
 
 -- Права выдаются только существующим объектам; будущие объекты проверяются отдельно.
 
 -- 6. Путь поиска по умолчанию для inspector
-ALTER ROLE inspector SET search_path = kalugin_food, exts, PUBLIC;
+alter role inspector set search_path = kalugin_food, exts, public;
